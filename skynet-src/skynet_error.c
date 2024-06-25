@@ -22,7 +22,7 @@ skynet_error(struct skynet_context * context, const char *msg, ...) {
 
 	char tmp[LOG_MESSAGE_SIZE];
 	char *data = NULL;
-
+    // 可变参数
 	va_list ap;
 
 	va_start(ap,msg);
