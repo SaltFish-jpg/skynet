@@ -9,39 +9,42 @@
 #include <string.h>
 
 struct skynet_monitor {
-	ATOM_INT version;
-	int check_version;
-	uint32_t source;
-	uint32_t destination;
+    ATOM_INT version;
+    int check_version;
+    uint32_t source;
+    uint32_t destination;
 };
 
-struct skynet_monitor * 
+struct skynet_monitor *
 skynet_monitor_new() {
-	struct skynet_monitor * ret = skynet_malloc(sizeof(*ret));
-	memset(ret, 0, sizeof(*ret));
-	return ret;
+    struct skynet_monitor *ret = skynet_malloc(sizeof(*ret));
+    memset(ret, 0, sizeof(*ret));
+    return ret;
 }
 
-void 
+void
 skynet_monitor_delete(struct skynet_monitor *sm) {
-	skynet_free(sm);
+    skynet_free(sm);
 }
 
-void 
+void
 skynet_monitor_trigger(struct skynet_monitor *sm, uint32_t source, uint32_t destination) {
-	sm->source = source;
-	sm->destination = destination;
-	ATOM_FINC(&sm->version);
+    sm->source = source;
+    sm->destination = destination;
+    ATOM_FINC(&sm->version);
 }
 
-void 
+void
 skynet_monitor_check(struct skynet_monitor *sm) {
-	if (sm->version == sm->check_version) {
-		if (sm->destination) {
-			skynet_context_endless(sm->destination);
-			skynet_error(NULL, "A message from [ :%08x ] to [ :%08x ] maybe in an endless loop (version = %d)", sm->source , sm->destination, sm->version);
-		}
-	} else {
-		sm->check_version = sm->version;
-	}
+    // 监视器线程监视的时候,如果还是上次检查的版本,就可能出现了循环
+    if (sm->version == sm->check_version) {
+        if (sm->destination) {
+            // 循环
+            skynet_context_endless(sm->destination);
+            skynet_error(NULL, "A message from [ :%08x ] to [ :%08x ] maybe in an endless loop (version = %d)",
+                         sm->source, sm->destination, sm->version);
+        }
+    } else {
+        sm->check_version = sm->version;
+    }
 }

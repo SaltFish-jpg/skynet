@@ -518,7 +518,7 @@ force_close(struct socket_server *ss, struct socket *s, struct socket_lock *l, s
     sp_del(ss->event_fd, s->fd);
     // 加锁
     socket_lock(l);
-    // socket 不是绑定socket才关闭
+    // socket 不是绑定状态才关闭
     if (type != SOCKET_TYPE_BIND) {
         if (close(s->fd) < 0) {
             perror("close socket:");
@@ -752,6 +752,13 @@ open_socket(struct socket_server *ss, struct request_open *request, struct socke
     return SOCKET_ERR;
 }
 
+/**
+ * 存error信息到result
+ * @param s
+ * @param result
+ * @param err
+ * @return
+ */
 static int
 report_error(struct socket *s, struct socket_message *result, const char *err) {
     result->id = s->id;
@@ -1073,7 +1080,7 @@ send_buffer(struct socket_server *ss, struct socket *s, struct socket_lock *l, s
         buf->sz = so.sz - s->dw_offset;
         buf->buffer = (void *) s->dw_buffer;
         s->wb_size += buf->sz;
-        // wbufferlist,待发送数据链表
+        // wbufferlist,待发送数据链表高优先级
         if (s->high.head == NULL) {
             s->high.head = s->high.tail = buf;
             buf->next = NULL;
@@ -1730,11 +1737,13 @@ ctrl_cmd(struct socket_server *ss, struct socket_message *result) {
 }
 
 // return -1 (ignore) when error
+// 出错时返回-1（忽略）
 static int
 forward_message_tcp(struct socket_server *ss, struct socket *s, struct socket_lock *l, struct socket_message *result) {
     int sz = s->p.size;
     char *buffer = MALLOC(sz);
     int n = (int) read(s->fd, buffer, sz);
+    // 读取失败
     if (n < 0) {
         FREE(buffer);
         switch (errno) {
@@ -1750,6 +1759,7 @@ forward_message_tcp(struct socket_server *ss, struct socket *s, struct socket_lo
         FREE(buffer);
         if (s->closing) {
             // Rare case : if s->closing is true, reading event is disable, and SOCKET_CLOSE is raised.
+            // 罕见情况：如果 s-> closing 为 true，则禁用读取事件，并提前SOCKET_CLOSE。
             if (nomore_sending_data(s)) {
                 force_close(ss, s, l, result);
             }
@@ -1758,23 +1768,28 @@ forward_message_tcp(struct socket_server *ss, struct socket *s, struct socket_lo
         int t = ATOM_LOAD(&s->type);
         if (t == SOCKET_TYPE_HALFCLOSE_READ) {
             // Rare case : Already shutdown read.
+            // 罕见情况：已关闭读取
             return -1;
         }
         if (t == SOCKET_TYPE_HALFCLOSE_WRITE) {
             // Remote shutdown read (write error) before.
+            // 远程关机之前读取（写入错误）。
             force_close(ss, s, l, result);
         } else {
+            // 为什么这里要关闭读,n == 0
             close_read(ss, s, result);
         }
         return SOCKET_CLOSE;
     }
-
+    // 如果是半关闭读,半关闭读的情况就是把接收数据直接丢弃
     if (halfclose_read(s)) {
         // discard recv data (Rare case : if socket is HALFCLOSE_READ, reading event is disable.)
+        // 丢弃接收数据（罕见情况：如果socket为HALFCLOSE_READ，读取事件被禁用
         FREE(buffer);
         return -1;
     }
-
+    // 正常读取到数据
+    // 统计读数据
     stat_read(ss, s, n);
 
     result->opaque = s->opaque;
@@ -1782,28 +1797,43 @@ forward_message_tcp(struct socket_server *ss, struct socket *s, struct socket_lo
     result->ud = n;
     result->data = buffer;
 
+    // 读取到的数据超过当前size,两倍扩展
     if (n == sz) {
         s->p.size *= 2;
         return SOCKET_MORE;
     } else if (sz > MIN_READ_BUFFER && n * 2 < sz) {
+        // 同样2倍的缩容
         s->p.size /= 2;
     }
-
     return SOCKET_DATA;
 }
 
+/**
+ * 生成udp地址
+ * @param protocol
+ * @param sa
+ * @param udp_address
+ * @return
+ */
 static int
 gen_udp_address(int protocol, union sockaddr_all *sa, uint8_t *udp_address) {
+    // 第一位放addr类型
     int addrsz = 1;
     udp_address[0] = (uint8_t) protocol;
+    // ipv4
     if (protocol == PROTOCOL_UDP) {
+        // 端口
         memcpy(udp_address + addrsz, &sa->v4.sin_port, sizeof(sa->v4.sin_port));
         addrsz += sizeof(sa->v4.sin_port);
+        // ipv4的addr
         memcpy(udp_address + addrsz, &sa->v4.sin_addr, sizeof(sa->v4.sin_addr));
         addrsz += sizeof(sa->v4.sin_addr);
     } else {
+        // ipv6
+        // 端口
         memcpy(udp_address + addrsz, &sa->v6.sin6_port, sizeof(sa->v6.sin6_port));
         addrsz += sizeof(sa->v6.sin6_port);
+        // ipv6的addr
         memcpy(udp_address + addrsz, &sa->v6.sin6_addr, sizeof(sa->v6.sin6_addr));
         addrsz += sizeof(sa->v6.sin6_addr);
     }
@@ -1817,6 +1847,7 @@ forward_message_udp(struct socket_server *ss, struct socket *s, struct socket_lo
     int n = recvfrom(s->fd, ss->udpbuffer, MAX_UDP_PACKAGE, 0, &sa.s, &slen);
     if (n < 0) {
         switch (errno) {
+            // 被中断,下次再读
             case EINTR:
             case AGAIN_WOULDBLOCK:
                 return -1;
@@ -1827,20 +1858,26 @@ forward_message_udp(struct socket_server *ss, struct socket *s, struct socket_lo
         result->data = strerror(error);
         return SOCKET_ERR;
     }
+    // 统计
     stat_read(ss, s, n);
 
     uint8_t *data;
     if (slen == sizeof(sa.v4)) {
         if (s->protocol != PROTOCOL_UDP)
             return -1;
+        // 最后填充udp地址
+        // udpIP类型(ipv6) 1位,端口2位,ip地址4位
         data = MALLOC(n + 1 + 2 + 4);
         gen_udp_address(PROTOCOL_UDP, &sa, data + n);
     } else {
         if (s->protocol != PROTOCOL_UDPv6)
             return -1;
+        // 最后填充udp地址
+        // udpIP类型(ipv6) 1位,端口2位,ip地址16位
         data = MALLOC(n + 1 + 2 + 16);
         gen_udp_address(PROTOCOL_UDPv6, &sa, data + n);
     }
+    // 复制接收到的数据到data
     memcpy(data, ss->udpbuffer, n);
 
     result->opaque = s->opaque;
@@ -2101,20 +2138,21 @@ socket_server_poll(struct socket_server *ss, struct socket_message *result, int 
                 skynet_error(NULL, "socket-server: invalid socket");
                 break;
             default:
+                // 其它状态就走正常的处理
                 // 如果是可读事件
                 if (e->read) {
                     int type;
                     // tcp 协议
                     if (s->protocol == PROTOCOL_TCP) {
-                        // 转发协议
+                        // 转发协议,最终读到的数据在result中
                         type = forward_message_tcp(ss, s, &l, result);
-                        // MORE可以多次处理
+                        // MORE可以多次处理,数据没读完,这个事件保留
                         if (type == SOCKET_MORE) {
                             --ss->event_index;
                             return SOCKET_DATA;
                         }
                     } else {
-                        // UDP 处理
+                        // UDP 处理,最终读到的数据在result中
                         type = forward_message_udp(ss, s, &l, result);
                         if (type == SOCKET_UDP) {
                             // try read again
@@ -2126,7 +2164,7 @@ socket_server_poll(struct socket_server *ss, struct socket_message *result, int 
                     if (e->write && type != SOCKET_CLOSE && type != SOCKET_ERR) {
                         // Try to dispatch write message next step if write flag set.
                         e->read = false;
-                        // 回退不处理
+                        // 可读处理完了,回退下次处理这个事件的可写部分
                         --ss->event_index;
                     }
                     if (type == -1)
@@ -2140,25 +2178,59 @@ socket_server_poll(struct socket_server *ss, struct socket_message *result, int 
                         break;
                     return type;
                 }
+                // 错误
                 if (e->error) {
+                    //  getsockopt、setsockopt - 获取和设置套接字选项
+                    //  int getsockopt(int sockfd , int level , int optname ,
+                    //                      void optval [restrict *. optlen ],
+                    //                      socklen_t *restrict optlen );
+                    //  int setsockopt(int sockfd , int level , int optname ,
+                    //                      const void optval [. optlen ],
+                    //                      socklen_t optlen );
+                    // 成功时，标准选项将返回零。出错时，将返回 -1，并设置errno以指示错误。
+                    // 读取error
                     int error;
                     socklen_t len = sizeof(error);
                     int code = getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &error, &len);
                     const char *err = NULL;
+                    // 读取error出错
                     if (code < 0) {
                         err = strerror(errno);
                     } else if (error != 0) {
+                        // 读取error成功,且存在error
                         err = strerror(error);
                     } else {
                         err = "Unknown error";
                     }
                     return report_error(s, result, err);
                 }
+                // 关于shutdown:
+                // 执行shutdown(SHUT_WR)操作时会发送一个FIN,并用SEND_SHUTDOWN标记套接字
+                // 执行shutdown(SHUT_RD)时不发送任何内容,并用RCV_SHUTDOWN标记套接字
+                // 接收FIN用,RCV_SHUTDOWN标记套接字
+                //
+                // 关于epoll:
+                // 如果套接字标记有SEND_SHUTDOWN和RCV_SHUTDOWN,poll将返回EPOLLHUP。EPOLLHUP 表示读写都关闭
+                // 如果套接字标记有RCV_SHUTDOWN,poll将返回EPOLLRDHUP。
+                // EPOLLRDHUP 可以作为一种读关闭的标志,不能读的意思内核不能再往内核缓冲区中增加新的内容。已经在内核缓冲区中的内容，用户态依然能够读取到
+                //
+                // 因此该HUP事件可以理解为:
+                // EPOLLRDHUP:已收到FIN或已调用shutdown(SHUT_RD)。无论如何读取套接字已半挂起，也就是说，您将不会再读取任何数据。
+                // EPOLLHUP:您已挂起两个半套接字。读取半套接字与上一点类似，对于发送半套接字,执行的操作类似于shutdown(SHUT_WR)。
+                //
+                // 为了完成正常关闭,我会这样做:
+                // 执行shutdown(SHUT_WR)发送FIN并标记发送数据的结束
+                // 通过轮询等待对等方执行相同操作，直到获得EPOLLRDHUP。
+                // 现在您可以优雅地关闭套接字了。
                 if (e->eof) {
+                    // EOF 指对端关闭(FIN)
                     // For epoll (at least), FIN packets are exchanged both ways.
+                    // 对于 epoll（至少）来说，FIN 数据包是双向交换的
                     // See: https://stackoverflow.com/questions/52976152/tcp-when-is-epollhup-generated
                     int halfclose = halfclose_read(s);
+                    // 对方关闭,这边也关闭
                     force_close(ss, s, &l, result);
+                    // 不是半关闭,返回关闭状态给上层
                     if (!halfclose) {
                         return SOCKET_CLOSE;
                     }
